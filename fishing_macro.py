@@ -1,3 +1,4 @@
+```python
 import time
 import threading
 
@@ -13,13 +14,14 @@ from pynput import keyboard
 
 SCAN_INTERVAL = 0.01
 BAR_TIMEOUT = 30
-BAR_END_DELAY = 0.5
+BAR_END_DELAY = 0.7
 RECAST_DELAY = 0.5
 
 COLLECT_DELAY = 1.0
 COLLECT_HOLD_TIME = 3.0
 
-# Approximate fishing meter region (screen fractions)
+# Fishing meter region as fractions of screen width and height.
+# Adjust these if the meter appears outside this area.
 ROI = (0.73, 0.28, 0.80, 0.75)
 
 MIN_ZONE_AREA = 12
@@ -29,7 +31,6 @@ MIN_INDICATOR_AREA = 5
 
 pyautogui.FAILSAFE = True
 pydirectinput.PAUSE = 0
-
 
 running = threading.Event()
 quit_program = threading.Event()
@@ -58,6 +59,8 @@ def quit_macro():
 
 
 listener = keyboard.GlobalHotKeys({
+    "-": toggle_macro,
+    "=": quit_macro,
     "<f6>": toggle_macro,
     "<f7>": quit_macro,
 })
@@ -65,7 +68,7 @@ listener.start()
 
 
 def get_meter_data(sct):
-    """Detect the colored target zone and white indicator."""
+    """Detect the target zone and white indicator with flexible color ranges."""
 
     screen = sct.monitors[1]
 
@@ -89,24 +92,24 @@ def get_meter_data(sct):
     bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
-    # White indicator
+    # More tolerant white detection for darker nighttime scenes.
     white_mask = cv2.inRange(
         hsv,
-        np.array([0, 0, 180]),
-        np.array([180, 75, 255]),
+        np.array([0, 0, 145]),
+        np.array([180, 100, 255]),
     )
 
-    # Yellow target zone
+    # Flexible yellow detection.
     yellow_mask = cv2.inRange(
         hsv,
-        np.array([15, 65, 80]),
-        np.array([38, 255, 255]),
+        np.array([12, 45, 60]),
+        np.array([42, 255, 255]),
     )
 
-    # Green target zone
+    # Flexible green detection.
     green_mask = cv2.inRange(
         hsv,
-        np.array([39, 65, 70]),
+        np.array([35, 40, 50]),
         np.array([100, 255, 255]),
     )
 
@@ -124,6 +127,7 @@ def get_meter_data(sct):
 
     zone_mask = cv2.bitwise_or(yellow_mask, green_mask)
 
+    # Find target zone candidates.
     contours, _ = cv2.findContours(
         zone_mask,
         cv2.RETR_EXTERNAL,
@@ -142,9 +146,11 @@ def get_meter_data(sct):
     if not zones:
         return None
 
+    # Largest colored component is treated as the target zone.
     zones.sort(key=lambda item: item[0], reverse=True)
     _, zone_top, zone_bottom = zones[0]
 
+    # Find white indicator candidates.
     contours, _ = cv2.findContours(
         white_mask,
         cv2.RETR_EXTERNAL,
@@ -167,6 +173,7 @@ def get_meter_data(sct):
     if not indicators:
         return None
 
+    # Largest qualifying white component is treated as the indicator.
     indicators.sort(key=lambda item: item[0], reverse=True)
     _, indicator_y = indicators[0]
 
@@ -174,9 +181,11 @@ def get_meter_data(sct):
 
 
 print("Roblox Fishing Macro ready")
-print("F6 = start / pause")
-print("F7 = exit")
-print("Position mouse over the casting spot before starting.")
+print("- = start / pause")
+print("= = exit")
+print("F6 = start / pause (alternative)")
+print("F7 = exit (alternative)")
+print("Position your mouse over the casting spot before starting.")
 
 mouse_down = False
 
@@ -192,9 +201,10 @@ try:
                 time.sleep(0.05)
                 continue
 
+            # Remember the casting position.
             cast_position = pyautogui.position()
 
-            # Cast once
+            # Cast once.
             pyautogui.click(
                 cast_position.x,
                 cast_position.y,
@@ -202,11 +212,10 @@ try:
             print("Cast! Waiting for meter...")
 
             start_time = time.time()
-            last_seen = start_time
             found_meter = False
             consecutive_hits = 0
 
-            # Wait for the meter to appear
+            # Wait for the meter to appear.
             while running.is_set() and not quit_program.is_set():
 
                 data = get_meter_data(sct)
@@ -218,7 +227,6 @@ try:
 
                 if consecutive_hits >= 3:
                     found_meter = True
-                    last_seen = time.time()
                     break
 
                 if time.time() - start_time >= BAR_TIMEOUT:
@@ -236,7 +244,9 @@ try:
 
             print("Meter detected - controlling indicator")
 
-            # Control indicator until the meter disappears
+            last_seen = time.time()
+
+            # Control the indicator until the meter disappears.
             while running.is_set() and not quit_program.is_set():
 
                 data = get_meter_data(sct)
@@ -254,30 +264,34 @@ try:
                 indicator_y, zone_top, zone_bottom = data
 
                 zone_center = (zone_top + zone_bottom) / 2
-                zone_height = zone_bottom - zone_top
+                zone_height = max(1, zone_bottom - zone_top)
 
-                # Aim slightly below center
+                # Aim slightly below the zone center.
                 target_y = zone_center + zone_height * 0.10
 
                 if indicator_y > target_y:
-                    # Indicator too low: hold mouse to move up
+                    # Indicator too low: hold mouse to move it upward.
                     if not mouse_down:
+                        pyautogui.moveTo(
+                            cast_position.x,
+                            cast_position.y,
+                        )
                         pyautogui.mouseDown()
                         mouse_down = True
                 else:
-                    # Indicator reached target: release mouse
+                    # Indicator is high enough: release to let it fall.
                     if mouse_down:
                         pyautogui.mouseUp()
                         mouse_down = False
 
                 time.sleep(SCAN_INTERVAL)
 
-            # Always release mouse after the minigame
+            # Release mouse when the meter disappears.
             if mouse_down:
                 pyautogui.mouseUp()
                 mouse_down = False
 
-            # Collect the item
+            # Collect the item.
             if running.is_set() and not quit_program.is_set():
 
                 print("Waiting for collection prompt...")
@@ -313,3 +327,4 @@ finally:
     quit_program.set()
     listener.stop()
     print("Macro closed.")
+```
