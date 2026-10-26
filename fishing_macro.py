@@ -1,8 +1,9 @@
-"""Roblox fishing macro with screen-based meter tracking.
+"""
+Roblox fishing macro with adaptive screen-based meter tracking.
 
 Hotkeys:
-  - or F6: start / pause
-  = or F7: quit
+  - or F6: Start / pause
+  = or F7: Quit
 
 Requirements:
   pip install opencv-python mss numpy pyautogui pydirectinput pynput
@@ -25,36 +26,46 @@ from pynput import keyboard
 
 @dataclass(frozen=True)
 class Settings:
-    # Fractions of the primary monitor: (left, top, right, bottom).
-    roi: tuple[float, float, float, float] = (0.73, 0.28, 0.80, 0.75)
+    # Screen region as fractions of the primary monitor:
+    # (left, top, right, bottom).
+    roi: tuple[float, float, float, float] = (
+        0.73, 0.28, 0.80, 0.75
+    )
 
-    scan_interval: float = 0.02
+    # Low-end laptop: start at 0.04; lower it if performance allows.
+    scan_interval: float = 0.04
+
     min_zone_area: float = 12
     min_indicator_area: float = 5
+
+    # End tracking only after this many consecutive missing frames.
     missing_frames_to_end: int = 12
     meter_timeout: float = 40.0
 
+    # Tracking and control.
     input_latency: float = 0.06
-    velocity_smoothing: float = 0.20
+    velocity_smoothing: float = 0.30
     target_offset: float = 0.0
     target_hysteresis: float = 1.0
     max_prediction: float = 0.10
+    min_prediction: float = 0.015
     min_velocity_samples: int = 3
     max_abs_velocity: float = 2500.0
 
-    # Adaptive tracking
-    velocity_history_size: int = 7
-    min_prediction: float = 0.015
+    # Adaptive tracking.
+    velocity_history_size: int = 5
     adaptive_latency_gain: float = 0.75
     latency_smoothing: float = 0.15
     adaptive_latency_min: float = 0.015
     adaptive_latency_max: float = 0.12
     reversal_damping: float = 0.35
 
+    # Collection cycle.
     collect_delay: float = 1.0
     collect_hold_time: float = 3.0
     recast_delay: float = 0.6
 
+    # Indicator color detection.
     white_v_min: int = 145
     white_s_max: int = 100
 
@@ -67,12 +78,13 @@ pydirectinput.PAUSE = 0
 running = threading.Event()
 quit_program = threading.Event()
 input_lock = threading.Lock()
+
 mouse_down = False
 key_down = False
 
 
 def release_controls() -> None:
-    """Release any inputs this script may have held."""
+    """Release any mouse or keyboard inputs held by the macro."""
     global mouse_down, key_down
 
     with input_lock:
@@ -89,8 +101,11 @@ def release_controls() -> None:
         key_down = False
 
 
-def set_mouse(should_hold: bool, position: tuple[int, int]) -> None:
-    """Change mouse state only when necessary."""
+def set_mouse(
+    should_hold: bool,
+    position: tuple[int, int],
+) -> None:
+    """Update mouse state only when it needs to change."""
     global mouse_down
 
     with input_lock:
@@ -98,6 +113,7 @@ def set_mouse(should_hold: bool, position: tuple[int, int]) -> None:
             pyautogui.moveTo(*position)
             pyautogui.mouseDown()
             mouse_down = True
+
         elif not should_hold and mouse_down:
             pyautogui.mouseUp()
             mouse_down = False
@@ -106,6 +122,7 @@ def set_mouse(should_hold: bool, position: tuple[int, int]) -> None:
 def toggle_macro() -> None:
     if quit_program.is_set():
         return
+
     if running.is_set():
         running.clear()
         release_controls()
@@ -124,17 +141,23 @@ def quit_macro() -> None:
 
 def wait_while_running(seconds: float) -> bool:
     deadline = time.monotonic() + max(0.0, seconds)
+
     while time.monotonic() < deadline:
         if not running.is_set() or quit_program.is_set():
             return False
-        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+
+        time.sleep(
+            min(0.02, max(0.0, deadline - time.monotonic()))
+        )
+
     return running.is_set() and not quit_program.is_set()
 
 
 def capture_roi(sct: mss.mss) -> np.ndarray:
-    """Capture only the configured portion of the primary monitor."""
+    """Capture the configured part of the primary monitor."""
     monitor = sct.monitors[1]
     left, top, right, bottom = CFG.roi
+
     x1 = monitor["left"] + int(monitor["width"] * left)
     y1 = monitor["top"] + int(monitor["height"] * top)
     x2 = monitor["left"] + int(monitor["width"] * right)
@@ -146,46 +169,77 @@ def capture_roi(sct: mss.mss) -> np.ndarray:
         "width": max(1, x2 - x1),
         "height": max(1, y2 - y1),
     })
-    return cv2.cvtColor(np.asarray(shot), cv2.COLOR_BGRA2BGR)
+
+    return cv2.cvtColor(
+        np.asarray(shot),
+        cv2.COLOR_BGRA2BGR,
+    )
 
 
-def largest_zone(hsv: np.ndarray) -> tuple[int, int, int, int] | None:
-    """Return the most plausible colored target zone as x, y, width, height."""
+def largest_zone(
+    hsv: np.ndarray,
+) -> tuple[int, int, int, int] | None:
+    """Find the most plausible colored target zone."""
     yellow = cv2.inRange(
-        hsv, np.array([12, 45, 60]), np.array([42, 255, 255])
+        hsv,
+        np.array([12, 45, 60]),
+        np.array([42, 255, 255]),
     )
+
     green = cv2.inRange(
-        hsv, np.array([35, 40, 50]), np.array([100, 255, 255])
+        hsv,
+        np.array([35, 40, 50]),
+        np.array([100, 255, 255]),
     )
+
     zone_mask = cv2.bitwise_or(yellow, green)
     kernel = np.ones((3, 3), np.uint8)
-    zone_mask = cv2.morphologyEx(zone_mask, cv2.MORPH_OPEN, kernel)
+
+    zone_mask = cv2.morphologyEx(
+        zone_mask,
+        cv2.MORPH_OPEN,
+        kernel,
+    )
 
     contours, _ = cv2.findContours(
-        zone_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        zone_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
     )
+
     candidates = []
+
     for contour in contours:
         area = cv2.contourArea(contour)
         x, y, w, h = cv2.boundingRect(contour)
+
         if area >= CFG.min_zone_area and h >= 4:
-            # Prefer substantial vertical target shapes without overfavoring height.
             score = area * min(h, 20)
             candidates.append((score, x, y, w, h))
 
     if not candidates:
         return None
 
-    _, x, y, w, h = max(candidates, key=lambda item: item[0])
+    _, x, y, w, h = max(
+        candidates,
+        key=lambda item: item[0],
+    )
+
     return x, y, w, h
 
 
-def get_meter_data(sct: mss.mss) -> tuple[float, float, float] | None:
-    """Return indicator center-y and target top/bottom in ROI coordinates."""
+def get_meter_data(
+    sct: mss.mss,
+) -> tuple[float, float, float] | None:
+    """
+    Return indicator center-y, target top, and target bottom.
+    All coordinates are relative to the captured ROI.
+    """
     bgr = capture_roi(sct)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
     zone = largest_zone(hsv)
+
     if zone is None:
         return None
 
@@ -197,32 +251,58 @@ def get_meter_data(sct: mss.mss) -> tuple[float, float, float] | None:
         np.array([0, 0, CFG.white_v_min]),
         np.array([180, CFG.white_s_max, 255]),
     )
+
     white = cv2.morphologyEx(
-        white, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)
+        white,
+        cv2.MORPH_OPEN,
+        np.ones((3, 3), np.uint8),
     )
 
     contours, _ = cv2.findContours(
-        white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        white,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
     )
+
     indicators = []
+
     for contour in contours:
         area = cv2.contourArea(contour)
         x, y, w, h = cv2.boundingRect(contour)
-        if area < CFG.min_indicator_area or not (2 <= h <= 35) or w > 35:
+
+        if area < CFG.min_indicator_area:
             continue
+
+        if not (2 <= h <= 35) or w > 35:
+            continue
+
         center_x = x + w / 2
         center_y = y + h / 2
-        # The horizontal distance is a useful discriminator when UI clutter is present.
-        indicators.append((abs(center_x - zone_center_x), -area, center_y))
+
+        # Prefer indicators horizontally aligned with the target zone.
+        indicators.append((
+            abs(center_x - zone_center_x),
+            -area,
+            center_y,
+        ))
 
     if not indicators:
         return None
 
-    indicator_y = min(indicators, key=lambda item: (item[0], item[1]))[2]
-    return float(indicator_y), float(zone_top), float(zone_top + zone_h)
+    indicator_y = min(
+        indicators,
+        key=lambda item: (item[0], item[1]),
+    )[2]
+
+    return (
+        float(indicator_y),
+        float(zone_top),
+        float(zone_top + zone_h),
+    )
 
 
 def collect_item() -> None:
+    """Release mouse controls and hold E to collect the item."""
     global key_down
 
     if not wait_while_running(CFG.collect_delay):
@@ -230,12 +310,14 @@ def collect_item() -> None:
 
     print("Attempting collection with E...")
     release_controls()
+
     if not wait_while_running(0.15):
         return
 
     with input_lock:
         if not running.is_set() or quit_program.is_set():
             return
+
         pydirectinput.keyDown("e")
         key_down = True
 
@@ -252,14 +334,24 @@ def collect_item() -> None:
 
 
 def control_meter(
-    sct: mss.mss, cast_position: tuple[int, int]
+    sct: mss.mss,
+    cast_position: tuple[int, int],
 ) -> bool:
-    """Track the indicator and adapt prediction to observed motion and timing."""
-    velocity_samples: deque[float] = deque(maxlen=CFG.velocity_history_size)
+    """
+    Track the indicator and predict its position.
+
+    Returns True when the meter disappears for enough consecutive frames.
+    Returns False if the macro is paused or stopped.
+    """
+    velocity_samples: deque[float] = deque(
+        maxlen=CFG.velocity_history_size
+    )
+
     velocity = 0.0
     last_velocity = 0.0
     last_time: float | None = None
     last_y: float | None = None
+
     missing_frames = 0
     detected_frames = 0
     holding = False
@@ -268,7 +360,10 @@ def control_meter(
         CFG.adaptive_latency_min,
         min(CFG.adaptive_latency_max, CFG.scan_interval),
     )
+
     smoothed_frame_dt = CFG.scan_interval
+    last_debug_time = 0.0
+
     print("Tracking indicator with adaptive prediction...")
 
     while running.is_set() and not quit_program.is_set():
@@ -276,33 +371,67 @@ def control_meter(
         data = get_meter_data(sct)
         now = time.monotonic()
 
+        # ---------------------------------------------------------
+        # Detection missing: do not keep using stale velocity.
+        # ---------------------------------------------------------
         if data is None:
             missing_frames += 1
+
+            # After a few missed frames, clear tracking history.
+            # This prevents stale movement estimates from lingering.
+            if missing_frames == 3:
+                velocity = 0.0
+                last_velocity = 0.0
+                last_time = None
+                last_y = None
+                velocity_samples.clear()
+                detected_frames = 0
+
+                if holding:
+                    set_mouse(False, cast_position)
+                    holding = False
+
+                print("Indicator temporarily lost; resetting tracker.")
+
             if missing_frames >= CFG.missing_frames_to_end:
                 set_mouse(False, cast_position)
                 print("Meter disappeared.")
                 return True
-            time.sleep(CFG.scan_interval)
+
+            elapsed = time.monotonic() - loop_started
+            time.sleep(max(0.0, CFG.scan_interval - elapsed))
             continue
 
+        # ---------------------------------------------------------
+        # Detection recovered.
+        # ---------------------------------------------------------
         missing_frames = 0
+
         indicator_y, zone_top, zone_bottom = data
         detected_frames += 1
 
         if last_time is not None and last_y is not None:
             dt = now - last_time
-            if dt > 0:
-                smoothed_frame_dt = 0.2 * dt + 0.8 * smoothed_frame_dt
+
+            # Ignore invalid time deltas.
+            if 0.001 <= dt <= 0.5:
+                smoothed_frame_dt = (
+                    0.2 * dt + 0.8 * smoothed_frame_dt
+                )
+
                 raw_velocity = (indicator_y - last_y) / dt
 
                 if abs(raw_velocity) <= CFG.max_abs_velocity:
                     velocity_samples.append(raw_velocity)
+
                     ordered = sorted(velocity_samples)
                     median_velocity = ordered[len(ordered) // 2]
 
                     direction_reversed = bool(
-                        last_velocity and median_velocity * last_velocity < 0
+                        last_velocity
+                        and median_velocity * last_velocity < 0
                     )
+
                     if direction_reversed:
                         velocity = (
                             CFG.reversal_damping * median_velocity
@@ -310,24 +439,40 @@ def control_meter(
                         )
                     else:
                         alpha = CFG.velocity_smoothing
-                        velocity = alpha * median_velocity + (1.0 - alpha) * velocity
+                        velocity = (
+                            alpha * median_velocity
+                            + (1.0 - alpha) * velocity
+                        )
 
                     last_velocity = median_velocity
 
-                    # Learn the useful prediction horizon from actual capture cadence.
-                    # Reduce it at high speed or on reversals to limit overshoot.
+                    # Adapt prediction to capture speed and direction changes.
                     speed_factor = min(
-                        1.0, 450.0 / max(450.0, abs(velocity))
+                        1.0,
+                        450.0 / max(450.0, abs(velocity)),
                     )
-                    reversal_factor = 0.5 if direction_reversed else 1.0
+
+                    reversal_factor = (
+                        0.5 if direction_reversed else 1.0
+                    )
+
                     desired_horizon = (
-                        smoothed_frame_dt * 1.5 * speed_factor * reversal_factor
-                        + CFG.adaptive_latency_gain * CFG.adaptive_latency_min
+                        smoothed_frame_dt
+                        * 1.5
+                        * speed_factor
+                        * reversal_factor
+                        + CFG.adaptive_latency_gain
+                        * CFG.adaptive_latency_min
                     )
+
                     desired_horizon = max(
                         CFG.adaptive_latency_min,
-                        min(CFG.adaptive_latency_max, desired_horizon),
+                        min(
+                            CFG.adaptive_latency_max,
+                            desired_horizon,
+                        ),
                     )
+
                     beta = CFG.latency_smoothing
                     adaptive_horizon = (
                         beta * desired_horizon
@@ -337,15 +482,22 @@ def control_meter(
         last_time = now
         last_y = indicator_y
 
+        # Wait for enough samples before trusting the prediction.
         if detected_frames < CFG.min_velocity_samples:
-            time.sleep(CFG.scan_interval)
+            elapsed = time.monotonic() - loop_started
+            time.sleep(max(0.0, CFG.scan_interval - elapsed))
             continue
 
+        # ---------------------------------------------------------
+        # Calculate predicted indicator position.
+        # ---------------------------------------------------------
         zone_height = max(1.0, zone_bottom - zone_top)
+
         target_y = (
             (zone_top + zone_bottom) / 2
             + zone_height * CFG.target_offset
         )
+
         prediction_time = min(
             CFG.max_prediction,
             max(
@@ -354,29 +506,51 @@ def control_meter(
                 CFG.input_latency * 0.5,
             ),
         )
+
         predicted_y = indicator_y + velocity * prediction_time
 
-        # Increase the margin modestly when recent speed samples disagree.
-        spread = (
-            max(velocity_samples) - min(velocity_samples)
-            if len(velocity_samples) >= 3 else 0.0
-        )
+        # Widen the safety margin if recent velocity measurements vary.
+        if len(velocity_samples) >= 3:
+            spread = max(velocity_samples) - min(velocity_samples)
+        else:
+            spread = 0.0
+
         uncertainty_margin = min(
-            zone_height * 0.12, spread * prediction_time * 0.15
+            zone_height * 0.12,
+            spread * prediction_time * 0.15,
         )
+
         margin = max(2.0, zone_height * 0.03) + uncertainty_margin
         hysteresis = max(0.0, CFG.target_hysteresis)
 
+        # ---------------------------------------------------------
+        # Hold/release controller with hysteresis.
+        #
+        # Screen Y increases downward. If predicted_y is below the
+        # target center, this controller chooses to hold the mouse.
+        # ---------------------------------------------------------
         if holding:
             if predicted_y <= target_y + margin - hysteresis:
                 holding = False
-        elif predicted_y >= target_y + margin + hysteresis:
-            holding = True
+        else:
+            if predicted_y >= target_y + margin + hysteresis:
+                holding = True
 
         set_mouse(holding, cast_position)
 
-        # Keep the scan cadence closer to the configured interval, accounting
-        # for time spent capturing and processing the image.
+        # Debug output once per second.
+        if now - last_debug_time >= 1.0:
+            print(
+                f"y={indicator_y:.1f}, "
+                f"predicted={predicted_y:.1f}, "
+                f"target={target_y:.1f}, "
+                f"velocity={velocity:.1f}, "
+                f"hold={holding}, "
+                f"misses={missing_frames}"
+            )
+            last_debug_time = now
+
+        # Keep scan cadence close to the configured interval.
         elapsed = time.monotonic() - loop_started
         time.sleep(max(0.0, CFG.scan_interval - elapsed))
 
@@ -391,12 +565,14 @@ def main() -> None:
         "<f6>": toggle_macro,
         "<f7>": quit_macro,
     })
+
     listener.start()
 
     print("Roblox Fishing Macro ready")
     print("- / F6 = start or pause")
     print("= / F7 = exit")
     print("Move your mouse over the casting spot before starting.")
+    print("Move the mouse to a screen corner to trigger failsafe.")
 
     try:
         with mss.mss() as sct:
@@ -408,6 +584,7 @@ def main() -> None:
 
                 pos = pyautogui.position()
                 cast_position = (int(pos.x), int(pos.y))
+
                 print("Casting...")
                 pyautogui.click(*cast_position)
 
@@ -424,8 +601,10 @@ def main() -> None:
                     if consecutive_hits >= 3:
                         found_meter = True
                         break
+
                     if time.monotonic() - start_time >= CFG.meter_timeout:
                         break
+
                     time.sleep(CFG.scan_interval)
 
                 if not running.is_set() or quit_program.is_set():
@@ -438,30 +617,38 @@ def main() -> None:
                     continue
 
                 print("Meter detected — precise control enabled")
+
                 finished = control_meter(sct, cast_position)
                 release_controls()
 
                 if not running.is_set() or quit_program.is_set():
                     continue
+
                 if finished:
                     collect_item()
+
                 wait_while_running(CFG.recast_delay)
 
     except pyautogui.FailSafeException:
         print("Failsafe triggered.")
+
     except KeyboardInterrupt:
         print("Stopped.")
+
     except Exception as exc:
         print(f"Unexpected error: {exc!r}")
         raise
+
     finally:
         running.clear()
         quit_program.set()
         release_controls()
+
         try:
             listener.stop()
         except Exception:
             pass
+
         print("Macro closed.")
 
 
