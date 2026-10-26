@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import cv2
@@ -40,6 +41,15 @@ class Settings:
     max_prediction: float = 0.10
     min_velocity_samples: int = 3
     max_abs_velocity: float = 2500.0
+
+    # Adaptive tracking
+    velocity_history_size: int = 7
+    min_prediction: float = 0.015
+    adaptive_latency_gain: float = 0.75
+    latency_smoothing: float = 0.15
+    adaptive_latency_min: float = 0.015
+    adaptive_latency_max: float = 0.12
+    reversal_damping: float = 0.35
 
     collect_delay: float = 1.0
     collect_hold_time: float = 3.0
@@ -244,18 +254,27 @@ def collect_item() -> None:
 def control_meter(
     sct: mss.mss, cast_position: tuple[int, int]
 ) -> bool:
-    """Track the indicator; return True when the meter disappears."""
+    """Track the indicator and adapt prediction to observed motion and timing."""
+    velocity_samples: deque[float] = deque(maxlen=CFG.velocity_history_size)
     velocity = 0.0
-    last_time = None
-    last_y = None
+    last_velocity = 0.0
+    last_time: float | None = None
+    last_y: float | None = None
     missing_frames = 0
     detected_frames = 0
     holding = False
 
-    print("Tracking indicator...")
+    adaptive_horizon = max(
+        CFG.adaptive_latency_min,
+        min(CFG.adaptive_latency_max, CFG.scan_interval),
+    )
+    smoothed_frame_dt = CFG.scan_interval
+    print("Tracking indicator with adaptive prediction...")
+
     while running.is_set() and not quit_program.is_set():
-        now = time.monotonic()
+        loop_started = time.monotonic()
         data = get_meter_data(sct)
+        now = time.monotonic()
 
         if data is None:
             missing_frames += 1
@@ -273,10 +292,47 @@ def control_meter(
         if last_time is not None and last_y is not None:
             dt = now - last_time
             if dt > 0:
+                smoothed_frame_dt = 0.2 * dt + 0.8 * smoothed_frame_dt
                 raw_velocity = (indicator_y - last_y) / dt
+
                 if abs(raw_velocity) <= CFG.max_abs_velocity:
-                    alpha = CFG.velocity_smoothing
-                    velocity = alpha * raw_velocity + (1.0 - alpha) * velocity
+                    velocity_samples.append(raw_velocity)
+                    ordered = sorted(velocity_samples)
+                    median_velocity = ordered[len(ordered) // 2]
+
+                    direction_reversed = bool(
+                        last_velocity and median_velocity * last_velocity < 0
+                    )
+                    if direction_reversed:
+                        velocity = (
+                            CFG.reversal_damping * median_velocity
+                            + (1.0 - CFG.reversal_damping) * velocity
+                        )
+                    else:
+                        alpha = CFG.velocity_smoothing
+                        velocity = alpha * median_velocity + (1.0 - alpha) * velocity
+
+                    last_velocity = median_velocity
+
+                    # Learn the useful prediction horizon from actual capture cadence.
+                    # Reduce it at high speed or on reversals to limit overshoot.
+                    speed_factor = min(
+                        1.0, 450.0 / max(450.0, abs(velocity))
+                    )
+                    reversal_factor = 0.5 if direction_reversed else 1.0
+                    desired_horizon = (
+                        smoothed_frame_dt * 1.5 * speed_factor * reversal_factor
+                        + CFG.adaptive_latency_gain * CFG.adaptive_latency_min
+                    )
+                    desired_horizon = max(
+                        CFG.adaptive_latency_min,
+                        min(CFG.adaptive_latency_max, desired_horizon),
+                    )
+                    beta = CFG.latency_smoothing
+                    adaptive_horizon = (
+                        beta * desired_horizon
+                        + (1.0 - beta) * adaptive_horizon
+                    )
 
         last_time = now
         last_y = indicator_y
@@ -286,13 +342,31 @@ def control_meter(
             continue
 
         zone_height = max(1.0, zone_bottom - zone_top)
-        target_y = (zone_top + zone_bottom) / 2 + zone_height * CFG.target_offset
-        prediction_time = min(CFG.input_latency, CFG.max_prediction)
+        target_y = (
+            (zone_top + zone_bottom) / 2
+            + zone_height * CFG.target_offset
+        )
+        prediction_time = min(
+            CFG.max_prediction,
+            max(
+                CFG.min_prediction,
+                adaptive_horizon,
+                CFG.input_latency * 0.5,
+            ),
+        )
         predicted_y = indicator_y + velocity * prediction_time
-        margin = max(2.0, zone_height * 0.03)
+
+        # Increase the margin modestly when recent speed samples disagree.
+        spread = (
+            max(velocity_samples) - min(velocity_samples)
+            if len(velocity_samples) >= 3 else 0.0
+        )
+        uncertainty_margin = min(
+            zone_height * 0.12, spread * prediction_time * 0.15
+        )
+        margin = max(2.0, zone_height * 0.03) + uncertainty_margin
         hysteresis = max(0.0, CFG.target_hysteresis)
 
-        # Image y increases downward. Hold while below the target, release above it.
         if holding:
             if predicted_y <= target_y + margin - hysteresis:
                 holding = False
@@ -300,7 +374,11 @@ def control_meter(
             holding = True
 
         set_mouse(holding, cast_position)
-        time.sleep(CFG.scan_interval)
+
+        # Keep the scan cadence closer to the configured interval, accounting
+        # for time spent capturing and processing the image.
+        elapsed = time.monotonic() - loop_started
+        time.sleep(max(0.0, CFG.scan_interval - elapsed))
 
     release_controls()
     return False
