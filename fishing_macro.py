@@ -31,9 +31,7 @@ class Settings:
     roi: tuple[float, float, float, float] = (
         0.73, 0.28, 0.80, 0.75
     )
-
-    # Low-end laptop: start at 0.04; lower it if performance allows.
-    scan_interval: float = 0.04
+    scan_interval: float = 0.01
 
     min_zone_area: float = 12
     min_indicator_area: float = 5
