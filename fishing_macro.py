@@ -1,6 +1,18 @@
-import time
+"""Roblox fishing macro with screen-based meter tracking.
+
+Hotkeys:
+  - or F6: start / pause
+  = or F7: quit
+
+Requirements:
+  pip install opencv-python mss numpy pyautogui pydirectinput pynput
+"""
+
+from __future__ import annotations
+
 import threading
-from collections import deque
+import time
+from dataclasses import dataclass
 
 import cv2
 import mss
@@ -10,495 +22,370 @@ import pydirectinput
 from pynput import keyboard
 
 
-# =========================
-# SETTINGS
-# =========================
+@dataclass(frozen=True)
+class Settings:
+    # Fractions of the primary monitor: (left, top, right, bottom).
+    roi: tuple[float, float, float, float] = (0.73, 0.28, 0.80, 0.75)
 
-# Screen region to scan, as proportions of screen width/height.
-# Adjust these if your fishing meter is in a different location.
-ROI = (0.73, 0.28, 0.80, 0.75)
+    scan_interval: float = 0.02
+    min_zone_area: float = 12
+    min_indicator_area: float = 5
+    missing_frames_to_end: int = 12
+    meter_timeout: float = 40.0
 
-SCAN_INTERVAL = 0.02
+    input_latency: float = 0.06
+    velocity_smoothing: float = 0.20
+    target_offset: float = 0.0
+    target_hysteresis: float = 1.0
+    max_prediction: float = 0.10
+    min_velocity_samples: int = 3
+    max_abs_velocity: float = 2500.0
 
-MIN_ZONE_AREA = 12
-MIN_INDICATOR_AREA = 5
+    collect_delay: float = 1.0
+    collect_hold_time: float = 3.0
+    recast_delay: float = 0.6
 
-MISSING_FRAMES_TO_END = 12
-METER_TIMEOUT = 40
-
-# Control tuning
-INPUT_LATENCY = 0.10
-VELOCITY_SMOOTHING = 0.25
-TARGET_OFFSET = 0.0
-TARGET_HYSTERESIS = 1
-MAX_PREDICTION = 0.12
-MIN_VELOCITY_SAMPLES = 3
-
-# Collection and recasting
-COLLECT_DELAY = 1.0
-COLLECT_HOLD_TIME = 3.0
-RECAST_DELAY = 0.6
-
-# Broad color detection for different lighting conditions.
-# These HSV ranges may need adjusting for your game's meter.
-ZONE_LOWER = np.array([15, 35, 100], dtype=np.uint8)
-ZONE_UPPER = np.array([45, 255, 255], dtype=np.uint8)
-
-INDICATOR_LOWER = np.array([0, 0, 180], dtype=np.uint8)
-INDICATOR_UPPER = np.array([180, 100, 255], dtype=np.uint8)
+    white_v_min: int = 145
+    white_s_max: int = 100
 
 
-# =========================
-# STATE
-# =========================
+CFG = Settings()
 
-running = False
-exiting = False
+pyautogui.FAILSAFE = True
+pydirectinput.PAUSE = 0
 
-state_lock = threading.Lock()
-worker_thread = None
+running = threading.Event()
+quit_program = threading.Event()
+input_lock = threading.Lock()
+mouse_down = False
+key_down = False
 
 
-# =========================
-# INPUT
-# =========================
+def release_controls() -> None:
+    """Release any inputs this script may have held."""
+    global mouse_down, key_down
 
-def set_mouse(holding, cast_position=False):
-    """Hold or release the left mouse button."""
-    try:
-        if holding:
-            if cast_position:
-                pyautogui.mouseDown()
-            else:
-                pyautogui.mouseDown()
-        else:
+    with input_lock:
+        try:
             pyautogui.mouseUp()
-    except Exception as exc:
-        print(f"Mouse input error: {exc}")
-
-
-def release_all():
-    """Release mouse and keyboard inputs safely."""
-    try:
-        pyautogui.mouseUp()
-    except Exception:
-        pass
-
-    try:
-        pydirectinput.keyUp("e")
-    except Exception:
-        pass
-
-
-# =========================
-# SCREEN DETECTION
-# =========================
-
-def get_screen_region(sct):
-    monitor = sct.monitors[1]
-    screen_width = monitor["width"]
-    screen_height = monitor["height"]
-
-    left = int(screen_width * ROI[0])
-    top = int(screen_height * ROI[1])
-    right = int(screen_width * ROI[2])
-    bottom = int(screen_height * ROI[3])
-
-    return {
-        "left": left,
-        "top": top,
-        "width": max(1, right - left),
-        "height": max(1, bottom - top),
-    }
-
-
-def largest_component(mask, min_area):
-    """Return the bounding box of the largest sufficiently large component."""
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask, connectivity=8
-    )
-
-    best = None
-    best_area = min_area
-
-    for i in range(1, count):
-        x, y, width, height, area = stats[i]
-
-        if area >= best_area:
-            best_area = area
-            best = (x, y, width, height, area)
-
-    return best
-
-
-def get_meter_data(frame):
-    """
-    Detect the target zone and white indicator.
-
-    Returns:
-        (zone_center_y, zone_height, indicator_center_y)
-    or None if the meter cannot be detected.
-    """
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    # Target zone
-    zone_mask = cv2.inRange(hsv, ZONE_LOWER, ZONE_UPPER)
-
-    # Indicator: bright, low-saturation pixels
-    indicator_mask = cv2.inRange(
-        hsv, INDICATOR_LOWER, INDICATOR_UPPER
-    )
-
-    # Remove tiny isolated noise.
-    kernel = np.ones((3, 3), np.uint8)
-    zone_mask = cv2.morphologyEx(
-        zone_mask, cv2.MORPH_OPEN, kernel
-    )
-    indicator_mask = cv2.morphologyEx(
-        indicator_mask, cv2.MORPH_OPEN, kernel
-    )
-
-    zone = largest_component(zone_mask, MIN_ZONE_AREA)
-    indicator = largest_component(
-        indicator_mask, MIN_INDICATOR_AREA
-    )
-
-    if zone is None or indicator is None:
-        return None
-
-    zx, zy, zw, zh, _ = zone
-    ix, iy, iw, ih, _ = indicator
-
-    zone_center_y = zy + zh / 2
-    indicator_center_y = iy + ih / 2
-
-    return zone_center_y, zh, indicator_center_y
-
-
-# =========================
-# FISHING CONTROL
-# =========================
-
-def control_meter(sct, region):
-    """
-    Control the mouse based on the indicator's position and velocity.
-
-    The image coordinate system has y increasing downward:
-    - Indicator moving down: positive velocity.
-    - Indicator moving up: negative velocity.
-    """
-    global running
-
-    start_time = time.time()
-    missing_frames = 0
-    holding = False
-
-    previous_y = None
-    previous_time = None
-    smoothed_velocity = 0.0
-    velocity_samples = deque(maxlen=5)
-
-    while running and not exiting:
-        if time.time() - start_time > METER_TIMEOUT:
-            print("Meter timeout; moving to collection.")
-            break
-
-        frame_start = time.time()
+        except Exception:
+            pass
+        mouse_down = False
 
         try:
-            screenshot = np.array(sct.grab(region))
-            frame = cv2.cvtColor(
-                screenshot, cv2.COLOR_BGRA2BGR
-            )
-        except Exception as exc:
-            print(f"Screen capture error: {exc}")
-            time.sleep(SCAN_INTERVAL)
-            continue
+            pydirectinput.keyUp("e")
+        except Exception:
+            pass
+        key_down = False
 
-        data = get_meter_data(frame)
+
+def set_mouse(should_hold: bool, position: tuple[int, int]) -> None:
+    """Change mouse state only when necessary."""
+    global mouse_down
+
+    with input_lock:
+        if should_hold and not mouse_down:
+            pyautogui.moveTo(*position)
+            pyautogui.mouseDown()
+            mouse_down = True
+        elif not should_hold and mouse_down:
+            pyautogui.mouseUp()
+            mouse_down = False
+
+
+def toggle_macro() -> None:
+    if quit_program.is_set():
+        return
+    if running.is_set():
+        running.clear()
+        release_controls()
+        print("PAUSED — controls released")
+    else:
+        running.set()
+        print("STARTING")
+
+
+def quit_macro() -> None:
+    running.clear()
+    quit_program.set()
+    release_controls()
+    print("EXITING")
+
+
+def wait_while_running(seconds: float) -> bool:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline:
+        if not running.is_set() or quit_program.is_set():
+            return False
+        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+    return running.is_set() and not quit_program.is_set()
+
+
+def capture_roi(sct: mss.mss) -> np.ndarray:
+    """Capture only the configured portion of the primary monitor."""
+    monitor = sct.monitors[1]
+    left, top, right, bottom = CFG.roi
+    x1 = monitor["left"] + int(monitor["width"] * left)
+    y1 = monitor["top"] + int(monitor["height"] * top)
+    x2 = monitor["left"] + int(monitor["width"] * right)
+    y2 = monitor["top"] + int(monitor["height"] * bottom)
+
+    shot = sct.grab({
+        "left": x1,
+        "top": y1,
+        "width": max(1, x2 - x1),
+        "height": max(1, y2 - y1),
+    })
+    return cv2.cvtColor(np.asarray(shot), cv2.COLOR_BGRA2BGR)
+
+
+def largest_zone(hsv: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Return the most plausible colored target zone as x, y, width, height."""
+    yellow = cv2.inRange(
+        hsv, np.array([12, 45, 60]), np.array([42, 255, 255])
+    )
+    green = cv2.inRange(
+        hsv, np.array([35, 40, 50]), np.array([100, 255, 255])
+    )
+    zone_mask = cv2.bitwise_or(yellow, green)
+    kernel = np.ones((3, 3), np.uint8)
+    zone_mask = cv2.morphologyEx(zone_mask, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(
+        zone_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    candidates = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        x, y, w, h = cv2.boundingRect(contour)
+        if area >= CFG.min_zone_area and h >= 4:
+            # Prefer substantial vertical target shapes without overfavoring height.
+            score = area * min(h, 20)
+            candidates.append((score, x, y, w, h))
+
+    if not candidates:
+        return None
+
+    _, x, y, w, h = max(candidates, key=lambda item: item[0])
+    return x, y, w, h
+
+
+def get_meter_data(sct: mss.mss) -> tuple[float, float, float] | None:
+    """Return indicator center-y and target top/bottom in ROI coordinates."""
+    bgr = capture_roi(sct)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    zone = largest_zone(hsv)
+    if zone is None:
+        return None
+
+    zone_x, zone_top, zone_w, zone_h = zone
+    zone_center_x = zone_x + zone_w / 2
+
+    white = cv2.inRange(
+        hsv,
+        np.array([0, 0, CFG.white_v_min]),
+        np.array([180, CFG.white_s_max, 255]),
+    )
+    white = cv2.morphologyEx(
+        white, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)
+    )
+
+    contours, _ = cv2.findContours(
+        white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    indicators = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        x, y, w, h = cv2.boundingRect(contour)
+        if area < CFG.min_indicator_area or not (2 <= h <= 35) or w > 35:
+            continue
+        center_x = x + w / 2
+        center_y = y + h / 2
+        # The horizontal distance is a useful discriminator when UI clutter is present.
+        indicators.append((abs(center_x - zone_center_x), -area, center_y))
+
+    if not indicators:
+        return None
+
+    indicator_y = min(indicators, key=lambda item: (item[0], item[1]))[2]
+    return float(indicator_y), float(zone_top), float(zone_top + zone_h)
+
+
+def collect_item() -> None:
+    global key_down
+
+    if not wait_while_running(CFG.collect_delay):
+        return
+
+    print("Attempting collection with E...")
+    release_controls()
+    if not wait_while_running(0.15):
+        return
+
+    with input_lock:
+        if not running.is_set() or quit_program.is_set():
+            return
+        pydirectinput.keyDown("e")
+        key_down = True
+
+    try:
+        wait_while_running(CFG.collect_hold_time)
+    finally:
+        with input_lock:
+            try:
+                pydirectinput.keyUp("e")
+            finally:
+                key_down = False
+
+    print("Collection key released.")
+
+
+def control_meter(
+    sct: mss.mss, cast_position: tuple[int, int]
+) -> bool:
+    """Track the indicator; return True when the meter disappears."""
+    velocity = 0.0
+    last_time = None
+    last_y = None
+    missing_frames = 0
+    detected_frames = 0
+    holding = False
+
+    print("Tracking indicator...")
+    while running.is_set() and not quit_program.is_set():
+        now = time.monotonic()
+        data = get_meter_data(sct)
 
         if data is None:
             missing_frames += 1
-
-            if missing_frames >= MISSING_FRAMES_TO_END:
-                break
-
-            time.sleep(SCAN_INTERVAL)
+            if missing_frames >= CFG.missing_frames_to_end:
+                set_mouse(False, cast_position)
+                print("Meter disappeared.")
+                return True
+            time.sleep(CFG.scan_interval)
             continue
 
         missing_frames = 0
+        indicator_y, zone_top, zone_bottom = data
+        detected_frames += 1
 
-        zone_center_y, zone_height, indicator_y = data
-        now = time.time()
+        if last_time is not None and last_y is not None:
+            dt = now - last_time
+            if dt > 0:
+                raw_velocity = (indicator_y - last_y) / dt
+                if abs(raw_velocity) <= CFG.max_abs_velocity:
+                    alpha = CFG.velocity_smoothing
+                    velocity = alpha * raw_velocity + (1.0 - alpha) * velocity
 
-        # Estimate indicator velocity.
-        if previous_y is not None and previous_time is not None:
-            dt = max(now - previous_time, 0.001)
-            velocity = (indicator_y - previous_y) / dt
+        last_time = now
+        last_y = indicator_y
 
-            velocity_samples.append(velocity)
+        if detected_frames < CFG.min_velocity_samples:
+            time.sleep(CFG.scan_interval)
+            continue
 
-            if len(velocity_samples) >= MIN_VELOCITY_SAMPLES:
-                average_velocity = sum(velocity_samples) / len(
-                    velocity_samples
-                )
-
-                smoothed_velocity = (
-                    VELOCITY_SMOOTHING * average_velocity
-                    + (1 - VELOCITY_SMOOTHING) * smoothed_velocity
-                )
-
-        previous_y = indicator_y
-        previous_time = now
-
-        # Predict where the indicator will be after input delay.
-        predicted_y = indicator_y + (
-            smoothed_velocity * INPUT_LATENCY
-        )
-
-        max_prediction_distance = max(
-            1.0, zone_height * MAX_PREDICTION
-        )
-
-        predicted_y = max(
-            indicator_y - max_prediction_distance,
-            min(
-                indicator_y + max_prediction_distance,
-                predicted_y,
-            ),
-        )
-
-        # Aim slightly above the center of the target zone.
-        target_y = (
-            zone_center_y
-            + zone_height * TARGET_OFFSET
-        )
-
-        # Start holding before the indicator falls too low.
+        zone_height = max(1.0, zone_bottom - zone_top)
+        target_y = (zone_top + zone_bottom) / 2 + zone_height * CFG.target_offset
+        prediction_time = min(CFG.input_latency, CFG.max_prediction)
+        predicted_y = indicator_y + velocity * prediction_time
         margin = max(2.0, zone_height * 0.03)
-        early_hold_distance = zone_height * 0.10
+        hysteresis = max(0.0, CFG.target_hysteresis)
 
-        # Since screen y increases downward, a larger y is lower.
-        start_holding_y = target_y - early_hold_distance
-        release_holding_y = start_holding_y - margin
-
+        # Image y increases downward. Hold while below the target, release above it.
         if holding:
-            # Release after the indicator has moved sufficiently upward.
-            if predicted_y < release_holding_y:
+            if predicted_y <= target_y + margin - hysteresis:
                 holding = False
-        else:
-            # Begin holding early as the indicator falls toward the zone.
-            if predicted_y > start_holding_y:
-                holding = True
+        elif predicted_y >= target_y + margin + hysteresis:
+            holding = True
 
-        set_mouse(holding)
+        set_mouse(holding, cast_position)
+        time.sleep(CFG.scan_interval)
 
-        # Keep the loop responsive without intentionally adding extra delay.
-        elapsed = time.time() - frame_start
-        time.sleep(max(0, SCAN_INTERVAL - elapsed))
-
-    set_mouse(False)
-
-
-# =========================
-# CAST AND COLLECT
-# =========================
-
-def cast_line():
-    """Cast the fishing line with a left click."""
-    print("Casting...")
-
-    pyautogui.mouseUp()
-    time.sleep(0.1)
-
-    pyautogui.mouseDown()
-    time.sleep(0.12)
-    pyautogui.mouseUp()
-
-    time.sleep(0.4)
-
-
-def wait_for_meter(sct, region):
-    """Wait until the fishing meter appears."""
-    print("Waiting for fishing meter...")
-
-    start_time = time.time()
-    consecutive_detections = 0
-
-    while running and not exiting:
-        if time.time() - start_time > METER_TIMEOUT:
-            print("No meter detected before timeout.")
-            return False
-
-        try:
-            screenshot = np.array(sct.grab(region))
-            frame = cv2.cvtColor(
-                screenshot, cv2.COLOR_BGRA2BGR
-            )
-            data = get_meter_data(frame)
-        except Exception as exc:
-            print(f"Detection error: {exc}")
-            data = None
-
-        if data is not None:
-            consecutive_detections += 1
-
-            if consecutive_detections >= 2:
-                print("Fishing meter detected.")
-                return True
-        else:
-            consecutive_detections = 0
-
-        time.sleep(SCAN_INTERVAL)
-
+    release_controls()
     return False
 
 
-def collect_item():
-    """Wait for the catch and hold E to collect it."""
-    global running
+def main() -> None:
+    listener = keyboard.GlobalHotKeys({
+        "-": toggle_macro,
+        "=": quit_macro,
+        "<f6>": toggle_macro,
+        "<f7>": quit_macro,
+    })
+    listener.start()
 
-    if not running or exiting:
-        return
-
-    print("Waiting before collection...")
-    time.sleep(COLLECT_DELAY)
-
-    if not running or exiting:
-        return
-
-    print("Holding E to collect...")
-    try:
-        pydirectinput.keyDown("e")
-        time.sleep(COLLECT_HOLD_TIME)
-    finally:
-        pydirectinput.keyUp("e")
-
-    if running and not exiting:
-        print("Collection complete.")
-        time.sleep(RECAST_DELAY)
-
-
-# =========================
-# MAIN LOOP
-# =========================
-
-def fishing_loop():
-    global running
-
-    print("Fishing macro started.")
+    print("Roblox Fishing Macro ready")
+    print("- / F6 = start or pause")
+    print("= / F7 = exit")
+    print("Move your mouse over the casting spot before starting.")
 
     try:
         with mss.mss() as sct:
-            region = get_screen_region(sct)
+            while not quit_program.is_set():
+                if not running.is_set():
+                    release_controls()
+                    time.sleep(0.05)
+                    continue
 
-            while running and not exiting:
-                cast_line()
+                pos = pyautogui.position()
+                cast_position = (int(pos.x), int(pos.y))
+                print("Casting...")
+                pyautogui.click(*cast_position)
 
-                if not running or exiting:
-                    break
+                start_time = time.monotonic()
+                consecutive_hits = 0
+                found_meter = False
 
-                detected = wait_for_meter(sct, region)
+                while running.is_set() and not quit_program.is_set():
+                    if get_meter_data(sct) is not None:
+                        consecutive_hits += 1
+                    else:
+                        consecutive_hits = 0
 
-                if not running or exiting:
-                    break
+                    if consecutive_hits >= 3:
+                        found_meter = True
+                        break
+                    if time.monotonic() - start_time >= CFG.meter_timeout:
+                        break
+                    time.sleep(CFG.scan_interval)
 
-                if detected:
-                    print("Controlling fishing meter...")
-                    control_meter(sct, region)
-                else:
-                    print("Meter not found; attempting collection.")
+                if not running.is_set() or quit_program.is_set():
+                    release_controls()
+                    continue
 
-                if not running or exiting:
-                    break
+                if not found_meter:
+                    print("Meter not detected; retrying.")
+                    wait_while_running(CFG.recast_delay)
+                    continue
 
-                collect_item()
+                print("Meter detected — precise control enabled")
+                finished = control_meter(sct, cast_position)
+                release_controls()
 
+                if not running.is_set() or quit_program.is_set():
+                    continue
+                if finished:
+                    collect_item()
+                wait_while_running(CFG.recast_delay)
+
+    except pyautogui.FailSafeException:
+        print("Failsafe triggered.")
+    except KeyboardInterrupt:
+        print("Stopped.")
     except Exception as exc:
-        print(f"Macro error: {exc}")
-
+        print(f"Unexpected error: {exc!r}")
+        raise
     finally:
-        release_all()
-        print("Fishing macro stopped.")
+        running.clear()
+        quit_program.set()
+        release_controls()
+        try:
+            listener.stop()
+        except Exception:
+            pass
+        print("Macro closed.")
 
-
-# =========================
-# START / PAUSE / EXIT
-# =========================
-
-def toggle_macro():
-    global running, worker_thread
-
-    if exiting:
-        return
-
-    if running:
-        running = False
-        release_all()
-        print("Macro paused.")
-    else:
-        running = True
-
-        if worker_thread is None or not worker_thread.is_alive():
-            worker_thread = threading.Thread(
-                target=fishing_loop,
-                daemon=True,
-            )
-            worker_thread.start()
-        else:
-            print("Macro resumed.")
-
-
-def exit_macro():
-    global running, exiting
-
-    running = False
-    exiting = True
-    release_all()
-
-    print("Exiting macro...")
-
-
-def on_press(key):
-    try:
-        if key == keyboard.Key.f6:
-            toggle_macro()
-            return
-
-        if key == keyboard.Key.f7:
-            exit_macro()
-            return
-
-        if hasattr(key, "char") and key.char is not None:
-            if key.char == "-":
-                toggle_macro()
-            elif key.char == "=":
-                exit_macro()
-
-    except Exception as exc:
-        print(f"Keyboard listener error: {exc}")
-
-
-# =========================
-# ENTRY POINT
-# =========================
 
 if __name__ == "__main__":
-    pyautogui.FAILSAFE = False
-    pydirectinput.PAUSE = 0
-
-    print("--------------------------------")
-    print("Roblox Fishing Macro")
-    print("--------------------------------")
-    print("- or F6 = Start / Pause")
-    print("= or F7 = Exit")
-    print("Keep Roblox visible while running.")
-    print("--------------------------------")
-
-    try:
-        with keyboard.Listener(on_press=on_press) as listener:
-            listener.join()
-    except KeyboardInterrupt:
-        exit_macro()
-    finally:
-        release_all()
+    main()
