@@ -1,4 +1,3 @@
-```python
 import time
 import threading
 
@@ -327,4 +326,3 @@ finally:
     quit_program.set()
     listener.stop()
     print("Macro closed.")
-```
